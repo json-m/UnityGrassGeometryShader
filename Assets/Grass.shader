@@ -38,15 +38,16 @@ Shader "Roystan/Grass"
     struct GrassVertexOutput
     {
         float4 pos : SV_POSITION;
+        float3 normal : NORMAL;
+        float2 uv : TEXCOORD0;
+        float3 worldPos : TEXCOORD1;
         #if !UNITY_PASS_SHADOWCASTER
-            float3 normal : NORMAL;
-            float2 uv : TEXCOORD0;
-            float3 worldPos : TEXCOORD1;
             float4 shadowCoord : TEXCOORD2;
             float3 viewDir : TEXCOORD3;
         #endif
     };
 
+    // Properties
     float _BladeHeight;
     float _BladeHeightRandom;
     float _BladeWidthRandom;
@@ -94,13 +95,17 @@ Shader "Roystan/Grass"
         GrassVertexOutput o;
         
         #if UNITY_PASS_SHADOWCASTER
-            float4 clipPos = UnityObjectToClipPos(float4(vertPos, 1));
+            o.pos = UnityObjectToClipPos(float4(vertPos, 1));
+            o.normal = normal; // Keep normal for potential use
+            o.uv = uv;
+            o.worldPos = worldPos;
+            
+            // Handle shadow bias
             #if UNITY_REVERSED_Z
-                clipPos.z = min(clipPos.z, clipPos.w * UNITY_NEAR_CLIP_VALUE);
+                o.pos.z = min(o.pos.z, o.pos.w * UNITY_NEAR_CLIP_VALUE);
             #else
-                clipPos.z = max(clipPos.z, clipPos.w * UNITY_NEAR_CLIP_VALUE);
+                o.pos.z = max(o.pos.z, o.pos.w * UNITY_NEAR_CLIP_VALUE);
             #endif
-            o.pos = clipPos;
         #else
             o.pos = UnityWorldToClipPos(worldPos);
             o.normal = UnityObjectToWorldNormal(normal);
@@ -116,7 +121,9 @@ Shader "Roystan/Grass"
     GrassVertexOutput GenerateGrassVertex(float3 vertPos, float width, float height, float forward, float2 uv, float3x3 transformMatrix)
     {
         float3 tangentPoint = float3(width, forward, height);
-        float3 tangentNormal = normalize(float3(0, -1, forward));
+        float3 tangentNormal = float3(0, -1, forward);
+        tangentNormal = normalize(tangentNormal); // Normalize the normal vector
+        
         float3 localPosition = vertPos + mul(transformMatrix, tangentPoint);
         float3 localNormal = mul(transformMatrix, tangentNormal);
         float3 worldPos = mul(unity_ObjectToWorld, float4(localPosition, 1)).xyz;
@@ -136,12 +143,13 @@ Shader "Roystan/Grass"
 
         float2 uv = pos.xz * _WindDistortionMap_ST.xy + _WindDistortionMap_ST.zw + _WindFrequency * _Time.y;
         float2 windSample = (tex2Dlod(_WindDistortionMap, float4(uv, 0, 0)).xy * 2 - 1) * _WindStrength;
-        float3 wind = normalize(float3(windSample.x, windSample.y, 0));
+        float3 wind = float3(windSample.x, windSample.y, 0);
+        wind = normalize(wind);
         float3x3 windRotation = AngleAxis3x3(UNITY_PI * windSample, wind);
 
         float3 vNormal = IN[0].normal;
         float4 vTangent = IN[0].tangent;
-        float3 vBinormal = cross(vNormal, vTangent) * vTangent.w;
+        float3 vBinormal = cross(vNormal, vTangent.xyz) * vTangent.w;
 
         float3x3 tangentToLocal = float3x3(
             vTangent.x, vBinormal.x, vNormal.x,
@@ -172,30 +180,6 @@ Shader "Roystan/Grass"
         triStream.Append(GenerateGrassVertex(pos, 0, height, forward, float2(0.5, 1), transformationMatrix));
     }
 
-    float CalculatePointLightAttenuation(float3 worldPos)
-    {
-        float3 lightVector = _WorldSpaceLightPos0.xyz - worldPos;
-        float lightDistance = length(lightVector);
-        float lightRange = length(unity_LightPosition[0].xyz) * _LightRangeMultiplier;
-        
-        // Normalized distance (0 to 1 range)
-        float normalizedDistance = lightDistance / lightRange;
-        
-        // Modified inverse square law with adjustable falloff
-        float falloff = 1.0 / pow(1.0 + normalizedDistance * 2.0, _LightFalloffExponent);
-        
-        // Smoother range attenuation
-        float rangeAttenuation = saturate(1.0 - pow(normalizedDistance, 1.5));
-        
-        // Combine all factors with increased control
-        float finalAttenuation = falloff * rangeAttenuation * _LightAttenuationMultiplier;
-        
-        // Add a small boost to close-range lighting
-        finalAttenuation += saturate(0.2 - normalizedDistance) * 0.5 * _LightAttenuationMultiplier;
-        
-        return finalAttenuation;
-    }
-
     float4 frag(GrassVertexOutput i) : SV_Target
     {
         #if UNITY_PASS_SHADOWCASTER
@@ -209,33 +193,31 @@ Shader "Roystan/Grass"
             
             if (_WorldSpaceLightPos0.w == 0.0)
             {
-                // Directional light
                 lightDir = normalize(_WorldSpaceLightPos0.xyz);
                 attenuation = 1.0;
             }
             else
             {
-                // Point light
                 float3 lightVector = _WorldSpaceLightPos0.xyz - i.worldPos;
                 lightDir = normalize(lightVector);
-                attenuation = CalculatePointLightAttenuation(i.worldPos);
+                float lightDistance = length(lightVector);
+                float lightRange = length(unity_LightPosition[0].xyz) * _LightRangeMultiplier;
+                float normalizedDistance = lightDistance / lightRange;
+                attenuation = 1.0 / (1.0 + normalizedDistance * normalizedDistance);
+                attenuation = pow(attenuation, _LightFalloffExponent) * _LightAttenuationMultiplier;
             }
 
             UNITY_LIGHT_ATTENUATION(shadowAttenuation, i, i.worldPos);
             attenuation *= shadowAttenuation;
             
-            // Direct lighting
             float NdotL = saturate(dot(worldNormal, lightDir));
             float3 directLight = NdotL * _LightColor0.rgb * attenuation;
             
-            // Enhanced translucency
             float translucency = pow(saturate(-dot(worldNormal, lightDir)), 1.5) * _TranslucentGain;
             float3 translucencyLight = translucency * _LightColor0.rgb * attenuation;
             
-            // Ambient lighting
             float3 ambient = ShadeSH9(float4(worldNormal, 1));
             
-            // Final color
             float3 albedo = lerp(_BottomColor.rgb, _TopColor.rgb, i.uv.y);
             float3 finalColor = albedo * (directLight + ambient + translucencyLight);
             
@@ -248,7 +230,14 @@ Shader "Roystan/Grass"
         float3 worldNormal = normalize(i.normal);
         float3 lightDir = normalize(_WorldSpaceLightPos0.xyz - i.worldPos);
         
-        float attenuation = CalculatePointLightAttenuation(i.worldPos);
+        float attenuation;
+        float3 lightVector = _WorldSpaceLightPos0.xyz - i.worldPos;
+        float lightDistance = length(lightVector);
+        float lightRange = length(unity_LightPosition[0].xyz) * _LightRangeMultiplier;
+        float normalizedDistance = lightDistance / lightRange;
+        attenuation = 1.0 / (1.0 + normalizedDistance * normalizedDistance);
+        attenuation = pow(attenuation, _LightFalloffExponent) * _LightAttenuationMultiplier;
+        
         UNITY_LIGHT_ATTENUATION(shadowAttenuation, i, i.worldPos);
         attenuation *= shadowAttenuation;
         
@@ -259,7 +248,7 @@ Shader "Roystan/Grass"
         float3 lighting = NdotL * _LightColor0.rgb * attenuation;
         float3 translucencyLight = translucency * _LightColor0.rgb * attenuation;
         
-        return float4(albedo * (lighting + translucencyLight), 0);
+        return float4(albedo * (lighting + translucencyLight), 1);
     }
 
     ENDCG
